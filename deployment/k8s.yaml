@@ -1,0 +1,221 @@
+# dataset-rnn -- Kubernetes manifest (ConfigMap, Deployment, Service, PodDisruptionBudget, HorizontalPodAutoscaler).
+#
+# IMAGE: `image:` below is always a real, valid image name (never a variable), so a plain `kubectl apply -f k8s.yaml` works.
+# If no registry owner was known when this file was generated, it is the local name `<app>:latest` with imagePullPolicy
+# IfNotPresent (build it locally: `docker build -t <app>:latest .`, on kind / minikube also load it into the cluster).
+# To use a pushed image instead, change the `image:` line or run:
+#   kubectl set image deployment/<app> <app>=<registry>/<owner>/<name>:<tag>
+#
+# CREDENTIALS: this file contains none. api_keys.json is mounted from the Secret `dataset-rnn-api-keys` (see below).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: dataset-rnn-config
+data:
+  # [CONFIG FIX] require-auth is plain configuration, not a secret -- it lived in a Secret object. (The credentials are in the
+  # separate `dataset-rnn-api-keys` Secret below.)
+  # [AUTH FALLBACK FIX] require-auth is "true" | "false" | "auto" (see app.py). The default "auto" enforces
+  # authentication whenever api_keys.json (mounted from the Secret below) holds a key, and -- because
+  # APP_ENV=production is set below -- NEVER falls open if that file is missing: requests get an explicit 503
+  # "no api_keys.json deployed" instead of a mystery 401. For staging/dev set require-auth to "false" (or
+  # APP_ENV to "staging").
+  # [SECRETS FIX] api_keys.json is NOT baked into the image and must not be committed to git. Provision a key with the script
+  # shipped in this bundle, then publish the file as a Secret (the pods mount it at /etc/automl/api_keys.json):
+  #   python create_api_key.py --owner my-service      # prints the raw key ONCE -> hand it to the caller
+  #   kubectl create secret generic dataset-rnn-api-keys --from-file=api_keys.json=./api_keys.json
+  # After adding / revoking a key re-publish the Secret: the same command plus `--dry-run=client -o yaml | kubectl apply -f -`.
+  # app.py reads api_keys.json on every request, and a mounted Secret refreshes within about a minute -- no restart needed.
+  require-auth: "auto"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dataset-rnn
+  labels:
+    app: dataset-rnn
+spec:
+  # [HPA FIX] no `replicas:` here on purpose: the HorizontalPodAutoscaler below owns the replica count (minReplicas 2). With a
+  # fixed value here every `kubectl apply` reset a scaled-out Deployment back to 2 pods in the middle of load.
+  selector:
+    matchLabels:
+      app: dataset-rnn
+  template:
+    metadata:
+      labels:
+        app: dataset-rnn
+    spec:
+      automountServiceAccountToken: false   # the API never talks to the Kubernetes API
+      terminationGracePeriodSeconds: 30
+      affinity:
+        podAntiAffinity:   # soft: replicas prefer different nodes, but a small cluster can still schedule them
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    app: dataset-rnn
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001   # = appuser in the Dockerfile
+        runAsGroup: 10001
+        fsGroup: 10001     # lets the non-root user read the mounted api-keys Secret
+        seccompProfile:
+          type: RuntimeDefault
+      # [CI/K8S IMAGE-REF FIX] dataset-rnn:latest is normally a private-registry image
+      # (ghcr.io/... , pushed by ci.yml's build-and-push job) -- without this,
+      # the kubelet has no credentials for that registry and every pod sits in
+      # ImagePullBackOff. Create the secret once per cluster with:
+      #   kubectl create secret docker-registry registry-pull-secret \
+      #     --docker-server=ghcr.io \
+      #     --docker-username=<same value as ci.yml's REGISTRY_USERNAME secret> \
+      #     --docker-password=<same value as ci.yml's REGISTRY_PASSWORD secret>
+      # (Skip this and delete the imagePullSecrets block below if the image is
+      # actually public or the cluster already has registry creds another way.)
+      imagePullSecrets:
+        - name: registry-pull-secret
+      containers:
+        - name: dataset-rnn
+          image: dataset-rnn:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8000
+          env:
+            - name: PORT
+              value: "8000"
+            - name: APP_ENV
+              value: "production"
+            - name: REQUIRE_AUTH
+              valueFrom:
+                configMapKeyRef:
+                  name: dataset-rnn-config
+                  key: require-auth
+            - name: API_KEYS_PATH
+              value: /etc/automl/api_keys.json   # mounted from the dataset-rnn-api-keys Secret (volume below)
+            - name: TMPDIR
+              value: /tmp   # the root filesystem is read-only; /tmp is a writable emptyDir (volume below)
+            # [PROXY-AWARE RATE LIMIT] behind the ingress controller (k8s-ingress.yaml) the TCP peer is the ingress pod, so without
+            # this every caller of an auth-off deployment shares one rate-limit bucket. 1 = trust the last X-Forwarded-For entry written
+            # by your single ingress controller; set 0 if pods are reached without any proxy (the header is then ignored).
+            - name: TRUSTED_PROXY_HOPS
+              value: "1"
+            # [RATE LIMIT] app.py defaults to 60 requests/min per API key PER POD (counted in memory, so with N replicas the
+            # effective limit is N x this value). 60 is too low for real scoring traffic -- tune to your peak (0 = off).
+            - name: RATE_LIMIT_PER_MINUTE
+              value: "600"
+            # [THRESHOLD] uncomment to override the decision threshold baked into feature_recipe.json without retraining
+            # (precision/recall trade-off, see README):
+            # - name: DECISION_THRESHOLD
+            #   value: "0.5"
+          startupProbe:
+            # [SLOW-LOAD FIX] heavy models (LLM_FINETUNE loads a transformer + adapter at startup, possibly
+            # downloading the base model) can take minutes to become Ready. Until this probe succeeds the
+            # liveness/readiness probes below are paused, so a pod that is merely still loading is not
+            # killed by livenessProbe. Allows up to 10 minutes; fast models pass on the first check.
+            # [STARTUP-PROBE FIX] this probe uses /healthz (process up), NOT /health: /health answers 503 until the api-keys Secret
+            # exists, so with the Secret missing (it is `optional: true` below) the kubelet used to KILL the container after the
+            # 10-minute budget and restart-loop it. app.py binds the port only after its artifacts are imported, so /healthz still
+            # waits for slow model loads; /health (readiness below) keeps a pod without keys out of the Service.
+            httpGet:
+              path: /healthz
+              port: 8000
+            periodSeconds: 10
+            failureThreshold: 60
+          readinessProbe:
+            # [K8S READINESS FIX] /health now returns a real HTTP 503 (not 200) when this
+            # model_type's required artifact failed to load -- see app.py's health handler comment
+            # -- so this probe (which only checks the status code) correctly keeps a broken pod out
+            # of the Service's endpoints instead of routing live traffic to it.
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            # [RULE 2/4] LIVENESS answers "is the process alive?", not "is the model ready?": /healthz is always 200 while uvicorn is up.
+            # Readiness (/health) still keeps a pod without a model / key store out of the Service, but a pod that merely waits for a
+            # Secret or is loading weights is no longer restarted in a loop by this probe.
+            httpGet:
+              path: /healthz
+              port: 8000
+            initialDelaySeconds: 15
+            periodSeconds: 20
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "512Mi"
+            limits:
+              cpu: "1"
+              memory: "1Gi"
+          lifecycle:
+            preStop:   # let the Service stop routing to this pod before uvicorn gets SIGTERM (no dropped requests on rollout)
+              exec:
+                command: ["sh", "-c", "sleep 5"]
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true   # nothing in app.py writes outside /tmp
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: api-keys
+              mountPath: /etc/automl
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: api-keys
+          secret:
+            secretName: dataset-rnn-api-keys
+            optional: true   # missing Secret -> pod still starts; with APP_ENV=production every predict call answers 503 until it exists
+            defaultMode: 0440
+        - name: tmp
+          emptyDir:
+            sizeLimit: 256Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: dataset-rnn-service
+spec:
+  selector:
+    app: dataset-rnn
+  ports:
+    - protocol: TCP
+      port: 80
+      targetPort: 8000
+  type: ClusterIP
+---
+# [AVAILABILITY FIX] a node drain / cluster upgrade could evict every replica at once; this keeps all but one running.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: dataset-rnn-pdb
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app: dataset-rnn
+---
+# [AUTOSCALING] a fixed replica count could not follow load: one CPU-bound scoring burst saturated both pods. Needs metrics-server
+# (present on EKS/GKE/AKS and most distributions); without it the HPA just reports "unable to get metrics" and the Deployment stays
+# at its initial single pod -- install metrics-server, or add `replicas: 2` back to the Deployment and drop this HPA.
+# The Deployment has no `replicas:` field, so `kubectl apply` never resets the HPA's replica count.
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: dataset-rnn-hpa
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: dataset-rnn
+  minReplicas: 2
+  maxReplicas: 6
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70

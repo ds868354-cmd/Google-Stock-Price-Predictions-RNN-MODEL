@@ -1,0 +1,278 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  # [ML CI] the "Run workflow" button on the Actions tab: re-run the pipeline by hand without a dummy commit
+  workflow_dispatch:
+
+# [LEAST PRIVILEGE] every job gets a read-only token unless it asks for more (build-and-push adds packages: write itself).
+permissions:
+  contents: read
+
+# a newer push to the same branch / PR cancels the older run instead of queueing duplicate builds
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest==8.3.3 httpx==0.27.2 pyyaml==6.0.2
+
+      - name: Refuse committed credentials
+        # [SECRETS GUARDRAIL] .env files, private keys / certificates and the key-store lock file must never be tracked. api_keys.json is
+        # tolerated ONLY while it is the pipeline's hash-only key store (salted hashes, no raw key): the training pipeline ships it inside
+        # the bundle zip, so a bundle uploaded as-is used to fail every CI run. Anything else in it (a raw key / token) still fails the build.
+        run: |
+          bad=$(git ls-files | grep -E '(^|/)(api_keys\.json\.lock|\.env(\..*)?|[^/]*\.(pem|key))$' || true)
+          for f in $(git ls-files | grep -E '(^|/)api_keys\.json$' || true); do
+            if python - "$f" <<'PY'
+          import json, sys
+          RAW = ("key", "api_key", "apikey", "secret", "token", "password", "value", "raw")
+          try:
+              keys = json.load(open(sys.argv[1])).get("keys")
+              ok = isinstance(keys, dict) and all(isinstance(v, dict) and "hash" in v and "salt" in v and not any(r in v for r in RAW) for v in keys.values())
+          except Exception:
+              ok = False
+          sys.exit(0 if ok else 1)
+          PY
+            then
+              echo "::warning file=$f::api_keys.json is tracked (salted hashes only). Keep it out of git: git rm --cached $f (it is in .gitignore) and mount it as a Secret."
+            else
+              bad="$bad $f"
+            fi
+          done
+          if [ -n "$(echo $bad)" ]; then
+            echo "Credential-like file(s) are committed to git:"; echo "$bad"
+            echo "Run: git rm --cached <file> (they are in .gitignore) and mount them as a secret instead."
+            exit 1
+          fi
+
+      - name: Validate Kubernetes manifests (names, placeholders, structure)
+        # [K8S GUARDRAIL] catches invalid object names (e.g. underscores), a malformed manifest or an unrenderable ${IMAGE_REF} on every
+        # push / PR instead of at `kubectl apply` time. Covers k8s.yaml AND the optional k8s-networkpolicy.yaml / k8s-ingress.yaml.
+        run: |
+          if [ -f k8s.yaml ]; then
+            IMAGE_REF=registry.example.com/owner/model:ci envsubst '${IMAGE_REF}' < k8s.yaml > /tmp/k8s.rendered.yaml
+            python - <<'PY'
+          import glob, re, sys, yaml
+          files = ["/tmp/k8s.rendered.yaml"] + sorted(glob.glob("k8s-*.yaml"))
+          bad = []
+          for path in files:
+              text = open(path).read()
+              if "${" in text:
+                  bad.append(path + ": unrendered placeholder")
+              for d in yaml.safe_load_all(text):
+                  if not d:
+                      continue
+                  n = (d.get("metadata") or dict()).get("name", "")
+                  if not d.get("kind") or not d.get("apiVersion"):
+                      bad.append(path + ": object without kind/apiVersion")
+                  if len(n) > 63 or not re.fullmatch(r"[a-z0-9]([-a-z0-9]*[a-z0-9])?", n):
+                      bad.append(path + ": " + str(d.get("kind")) + "/" + str(n))
+          if bad:
+              sys.exit("Invalid Kubernetes manifest: " + "; ".join(bad))
+          print("Kubernetes manifests OK:", ", ".join(files))
+          PY
+          else
+            echo "no k8s.yaml in this repo -- skipping"
+          fi
+
+      - name: Run test suite
+        run: pytest tests/ -v --tb=short
+
+      - name: Model quality gate (classification and regression aware)
+        # [ML CI] a degenerate or regressed model (roc_auc < 0.5, r2 <= 0 ...) must stop the pipeline BEFORE an image is built. Reads
+        # model_metrics.json (metric numbers only); your own targets live in ci_thresholds.json. A repo without the files skips the gate.
+        run: |
+          if [ -f model_quality_gate.py ]; then
+            python model_quality_gate.py
+          else
+            echo "no model_quality_gate.py in this repo -- skipping"
+          fi
+
+      - name: Enforce no-pickle/joblib guardrail
+        run: python bundler_check.py .
+
+      - name: Lint
+        run: |
+          pip install ruff==0.6.9
+          ruff check --select E9,F63,F7,F82 .
+
+      - name: Lint Dockerfile (hadolint)
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: Dockerfile
+          failure-threshold: error
+
+  build-and-push:
+    needs: test
+    if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      packages: write
+    env:
+      # [REGISTRY PARAMETERIZATION] No hardcoded org. Defaults are baked in at generation time, and every value can
+      # be overridden per repository with Actions *variables* (Settings > Secrets and variables > Actions >
+      # Variables) -- no workflow edit needed. An empty IMAGE_OWNER resolves to the repository owner at run time.
+      REGISTRY: ${{ vars.REGISTRY_HOST || 'ghcr.io' }}
+      IMAGE_OWNER: ${{ vars.IMAGE_OWNER || '' }}
+      IMAGE_NAME: ${{ vars.IMAGE_NAME || 'dataset_rnn' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compute image reference
+        id: img
+        run: |
+          OWNER="${IMAGE_OWNER:-$GITHUB_REPOSITORY_OWNER}"
+          echo "ref=${REGISTRY}/${OWNER,,}/${IMAGE_NAME,,}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to container registry
+        uses: docker/login-action@v3
+        with:
+          # docker/login-action needs a bare hostname here (e.g. ghcr.io); the org/name lives only in the tags.
+          # REGISTRY_USERNAME / REGISTRY_PASSWORD secrets are optional for ghcr.io: the built-in actor and
+          # GITHUB_TOKEN (packages: write above) are used when they are not set.
+          registry: ${{ env.REGISTRY }}
+          username: ${{ secrets.REGISTRY_USERNAME || github.actor }}
+          password: ${{ secrets.REGISTRY_PASSWORD || secrets.GITHUB_TOKEN }}
+
+      # [IMAGE SCAN] the image is built locally FIRST and scanned with Trivy; a fixable CRITICAL/HIGH vulnerability stops the job BEFORE
+      # anything is pushed to the registry. (The push below reuses the build cache, so the extra build is cheap.)
+      - name: Build image for scanning (no push)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          push: false
+          tags: scan-candidate:${{ github.sha }}
+          cache-from: type=gha
+
+      - name: Scan image for vulnerabilities (Trivy)
+        # [TRIVY TAG FIX] aquasecurity re-created every tag of this action WITH a leading v after its 2026 supply-chain incident and
+        # removed the old v-less tags, so `@0.28.0` no longer resolves: the job died in its set-up phase before any step ran, and
+        # build-and-push / docker-build-check (every model type) never built an image. v0.36.0 is the current release.
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: scan-candidate:${{ github.sha }}
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: "1"
+
+      - name: Smoke-run the image (container starts and /health answers)
+        run: |
+          docker run -d --name smoke -p 8000:8000 -e APP_ENV=staging -e REQUIRE_AUTH=false scan-candidate:${{ github.sha }}
+          ok=0
+          for i in $(seq 1 60); do
+            code=$(curl -s -o /tmp/health.json -w '%{http_code}' http://localhost:8000/health || true)
+            if [ "$code" = "200" ] || false; then ok=1; break; fi
+            if [ -z "$(docker ps -q -f name=smoke)" ]; then break; fi
+            sleep 2
+          done
+          echo "last /health status: $code"; cat /tmp/health.json 2>/dev/null || true; echo
+          docker logs smoke 2>&1 | tail -n 40
+          docker rm -f smoke > /dev/null 2>&1 || true
+          if [ "$ok" != "1" ]; then echo "::error::the container did not start or /health never returned a healthy status"; exit 1; fi
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          # Same registry/owner/name string k8s.yaml receives via IMAGE_REF (see k8s.yaml header), so the tag
+          # pushed here and the tag the cluster pulls cannot drift apart.
+          tags: |
+            ${{ steps.img.outputs.ref }}:${{ github.sha }}
+            ${{ steps.img.outputs.ref }}:latest
+
+      # [IMAGE-REF FIX] k8s.yaml keeps ${IMAGE_REF} as a placeholder and plain `kubectl apply` does not substitute it. This
+      # renders it with the tag pushed above; download the artifact and run `kubectl apply -f k8s.rendered.yaml`.
+      - name: Render k8s manifest (fills in IMAGE_REF)
+        run: |
+          if [ -f k8s.yaml ]; then
+            IMAGE_REF="${{ steps.img.outputs.ref }}:${{ github.sha }}" envsubst '${IMAGE_REF}' < k8s.yaml > k8s.rendered.yaml
+            if grep -F '${' k8s.rendered.yaml; then
+              echo "::error::unrendered placeholder left in k8s.rendered.yaml"
+              exit 1
+            fi
+          fi
+
+      - name: Upload rendered k8s manifest
+        uses: actions/upload-artifact@v4
+        with:
+          name: k8s-rendered
+          path: k8s.rendered.yaml
+          if-no-files-found: ignore
+
+  # Pull requests never reach build-and-push, so a broken Dockerfile only surfaced AFTER merging to the main branch.
+  docker-build-check:
+    needs: test
+    if: github.event_name == 'pull_request' || (github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/main')
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build image (no push)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          push: false
+          tags: pr-check:${{ github.sha }}
+          cache-from: type=gha
+
+      - name: Scan image for vulnerabilities (Trivy)
+        # [TRIVY TAG FIX] aquasecurity re-created every tag of this action WITH a leading v after its 2026 supply-chain incident and
+        # removed the old v-less tags, so `@0.28.0` no longer resolves: the job died in its set-up phase before any step ran, and
+        # build-and-push / docker-build-check (every model type) never built an image. v0.36.0 is the current release.
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: pr-check:${{ github.sha }}
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: "1"
+
+      - name: Smoke-run the image (container starts and /health answers)
+        run: |
+          docker run -d --name smoke -p 8000:8000 -e APP_ENV=staging -e REQUIRE_AUTH=false pr-check:${{ github.sha }}
+          ok=0
+          for i in $(seq 1 60); do
+            code=$(curl -s -o /tmp/health.json -w '%{http_code}' http://localhost:8000/health || true)
+            if [ "$code" = "200" ] || false; then ok=1; break; fi
+            if [ -z "$(docker ps -q -f name=smoke)" ]; then break; fi
+            sleep 2
+          done
+          echo "last /health status: $code"; cat /tmp/health.json 2>/dev/null || true; echo
+          docker logs smoke 2>&1 | tail -n 40
+          docker rm -f smoke > /dev/null 2>&1 || true
+          if [ "$ok" != "1" ]; then echo "::error::the container did not start or /health never returned a healthy status"; exit 1; fi

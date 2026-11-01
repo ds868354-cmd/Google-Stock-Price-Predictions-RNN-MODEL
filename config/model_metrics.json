@@ -1,0 +1,17 @@
+{
+  "best_model_name": null,
+  "metrics": {
+    "best_epoch": 95.0,
+    "best_val_loss": 0.0032421626784212764,
+    "epochs_run": 100.0,
+    "final_train_loss": 0.007630899336090399,
+    "final_val_loss": 0.0032505075462528916,
+    "mse": 693.985023131694,
+    "r2": 0.9948835534850424,
+    "rmse": 26.34359548603216
+  },
+  "model_type": "RNN",
+  "n_test": null,
+  "schema": 1,
+  "task": null
+}

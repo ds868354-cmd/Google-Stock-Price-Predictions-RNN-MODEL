@@ -1,0 +1,33 @@
+# dataset-rnn -- OPTIONAL NetworkPolicy:  kubectl apply -f k8s-networkpolicy.yaml
+# [LEAST PRIVILEGE] ingress used to be `namespaceSelector: {}` = ANY pod in ANY namespace. It is now limited to (a) your ingress
+# controller's namespace (ingress-nginx -- change the label value below if yours differs) and (b) pods in THIS namespace
+# (monitoring, a calling service). Check the namespace label with: kubectl get ns --show-labels
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: dataset-rnn-netpol
+spec:
+  podSelector:
+    matchLabels:
+      app: dataset-rnn
+  policyTypes: ["Ingress", "Egress"]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ingress-nginx
+        - podSelector: {}   # pods of the namespace this policy is applied in
+      ports:
+        - protocol: TCP
+          port: 8000
+  egress:
+    - to:   # cluster DNS (CoreDNS / kube-dns)
+        - namespaceSelector: {}
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53

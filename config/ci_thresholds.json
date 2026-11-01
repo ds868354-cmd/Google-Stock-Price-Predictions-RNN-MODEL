@@ -1,0 +1,6 @@
+{
+  "_comment": "Your model targets for ci.yml's quality gate. The floors (classification: roc_auc >= 0.5 and f1/recall/precision > 0; regression: r2 > 0) always apply; add stricter ones here, e.g. min: {roc_auc: 0.95, recall_positive: 0.8} for classification, or min: {r2: 0.7} and max: {rmse: 12.5} for regression. enforce=false downgrades failures to warnings.",
+  "enforce": true,
+  "min": {},
+  "max": {}
+}

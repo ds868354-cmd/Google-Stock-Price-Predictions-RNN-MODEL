@@ -1,0 +1,30 @@
+# dataset-rnn -- OPTIONAL Ingress (TLS + edge limits):  kubectl apply -f k8s-ingress.yaml
+# 1. replace host `model.example.com`;  2. create the TLS secret once:  kubectl create secret tls dataset-rnn-tls --cert=tls.crt --key=tls.key
+#    (or let cert-manager issue it: add the `cert-manager.io/cluster-issuer` annotation);  3. match ingressClassName to your controller.
+# limit-rpm is per client IP and shared by every pod behind this Ingress (the in-app limiter is per pod and per API key).
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: dataset-rnn-ingress
+  annotations:
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/force-ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/proxy-body-size: "5m"
+    nginx.ingress.kubernetes.io/limit-rpm: "600"
+    nginx.ingress.kubernetes.io/limit-burst-multiplier: "2"
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts: [model.example.com]
+      secretName: dataset-rnn-tls
+  rules:
+    - host: model.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: dataset-rnn-service
+                port:
+                  number: 80
